@@ -1,0 +1,416 @@
+import itertools
+import os
+import json
+
+import torch
+import detectron2
+import numpy as np
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+import random
+from fvcore.common.file_io import PathManager
+import time
+import datetime
+import logging
+
+from .coco_evaluation import COCOEvaluator, instances_to_coco_json, _evaluate_predictions_on_coco
+from detectron2.structures import Instances, Boxes
+from detectron2.data.datasets.builtin_meta import _get_coco_fewshot_instances_meta, _get_coco_instances_meta
+from detectron2.evaluation.evaluator import inference_context, DatasetEvaluators, DatasetEvaluator
+from detectron2.utils.comm import get_world_size, is_main_process
+from detectron2.utils.logger import log_every_n_seconds
+from detectron2.modeling.meta_arch.meta_rcnn import MetaRCNN
+
+
+class COCOPrecompEpisodicEvaluator(COCOEvaluator):
+    def __init__(self, dataset_name, cfg, distributed,
+                 output_dir=None, eval_classes='base', way=3, conditioned_output=True):
+        super(COCOPrecompEpisodicEvaluator, self).__init__(dataset_name, cfg, distributed, output_dir)
+        self.way = way
+        self.conditioned_output = conditioned_output
+        metadata = _get_coco_fewshot_instances_meta()
+        if eval_classes == 'base':
+            self._eval_classes = metadata["base_ids"]
+            self._cls_map = metadata["base_dataset_id_to_contiguous_id"]
+            self._eval_classes_names = metadata["base_classes"]
+            self._eval_classes_contiguous = [self._cls_map[id] for id in self._eval_classes]
+            self._cls_map_reverse = {v: k for k, v in self._cls_map.items()}
+        elif eval_classes == 'novel':
+            self._eval_classes = metadata["novel_ids"]
+            self._cls_map = metadata["novel_dataset_id_to_contiguous_id"]
+            self._eval_classes_names = metadata["novel_classes"]
+            self._eval_classes_contiguous = [self._cls_map[id] for id in self._eval_classes]
+            self._cls_map_reverse = {v: k for k, v in self._cls_map.item()}
+        else:
+            metadata = _get_coco_instances_meta()
+            self._eval_classes = metadata["thing_ids"]
+            self._cls_map = metadata["thing_dataset_id_to_contiguous_id"]
+            self._eval_classes_names = metadata["thing_classes"]
+            self._eval_classes_contiguous = [self._cls_map[id] for id in self._eval_classes]
+            self._cls_map_reverse = {v: k for k, v in self._cls_map.item()}
+
+    def process(self, inputs, model, supports):
+        """ Supports are preloaded lists of dicts.
+        """
+        for input in inputs:
+            rest_classes = torch.unique(input["instances"].gt_classes.to(self._cpu_device)).numpy().tolist()
+            while len(rest_classes) > 0:
+                category = random.choice(rest_classes)
+                epi_classes = [category]
+                for _ in range(self.way - 1):
+                    while True:
+                        other_cat = random.choice(self._eval_classes_contiguous)
+                        if other_cat not in epi_classes:
+                            epi_classes.append(other_cat)
+                            break
+
+                attentions = [sup for sup in supports if sup["class"] in epi_classes]
+                output = model(input, attentions)
+                assert "instances" in output
+                instances = output["instances"].to(self._cpu_device)
+                prediction = {"image_id": input["image_id"]}
+                if self.conditioned_output:
+                    map_dict = {ix: cls for ix, cls in enumerate(epi_classes)}
+                    real_classes = [map_dict[cls] for cls in output["instances"].pred_classes]
+                    output["instances"].pred_classes = torch.cat(real_classes)
+
+                epi_instances = Instances(instances.image_size)
+                pickups = torch.zeros_like(instances.pred_classes, dtype=torch.bool)
+                for cls in epi_classes:
+                    pickups += instances.pred_classes == cls
+                if torch.nonzero(pickups).numel() > 0:
+                    print("warning: no gt class pred found during this episode")
+                    for cat in epi_classes:
+                        if cat in rest_classes:
+                            rest_classes.remove(cat)
+
+                epi_instances.pred_classes = instances.pred_classes[pickups]
+                epi_instances.pred_boxes = instances.pred_boxes[pickups]
+                epi_instances.scores = instances.scores[pickups]
+                if hasattr(instances, "pred_masks"):
+                    epi_instances.pred_masks = instances.pred_masks[pickups]
+
+                prediction["instances"] = instances_to_coco_json(epi_instances, input["image_id"])
+                self._predictions.append(prediction)
+
+                for cat in epi_classes:
+                    if cat in rest_classes:
+                        rest_classes.remove(cat)
+
+    def _eval_predictions(self, tasks, predictions):
+        """
+        Evaluate predictions on the given tasks.
+        Fill self._results with the metrics of the tasks.
+        """
+        self._logger.info("Preparing results for COCO format ...")
+        self._coco_results = list(itertools.chain(*[x["instances"] for x in predictions]))
+
+        # unmap the category ids for COCO
+        if hasattr(self._metadata, "thing_dataset_id_to_contiguous_id"):
+            reverse_id_mapping = {
+                v: k for k, v in self._metadata.thing_dataset_id_to_contiguous_id.items()
+            }
+            for result in self._coco_results:
+                category_id = result["category_id"]
+                assert (
+                    category_id in reverse_id_mapping
+                ), "A prediction has category_id={}, which is not available in the dataset.".format(
+                    category_id
+                )
+                result["category_id"] = reverse_id_mapping[category_id]
+
+        if self._output_dir:
+            file_path = os.path.join(self._output_dir, "coco_instances_results.json")
+            self._logger.info("Saving results to {}".format(file_path))
+            with PathManager.open(file_path, "w") as f:
+                f.write(json.dumps(self._coco_results))
+                f.flush()
+
+        if not self._do_evaluation:
+            self._logger.info("Annotations are not available for evaluation.")
+            return
+
+        self._logger.info("Evaluating predictions ...")
+        # General detection evaluation
+        if not self._is_splits:
+            for task in sorted(tasks):
+                coco_eval = (
+                    _evaluate_predictions_on_coco(
+                        self._coco_api, self._coco_results, task, kpt_oks_sigmas=self._kpt_oks_sigmas,
+                        catIds=self._eval_classes
+                    )
+                    if len(self._coco_results) > 0
+                    else None  # cocoapi does not handle empty results very well
+                )
+
+                res = self._derive_coco_results(
+                    coco_eval, task, class_names=self._metadata.get("thing_classes")
+                )
+                self._results[task] = res
+        # Few-Shot detection evaluation
+        else:
+            self._results["bbox"] = {}
+            for split, classes, names in [
+                ("all", None, self._metadata.get("thing_classes")),
+                ("base", self._base_classes, self._metadata.get("base_classes")),
+                ("novel", self._novel_classes, self._metadata.get("novel_classes"))]:
+                if "all" not in self._dataset_name and \
+                        split not in self._dataset_name:
+                    continue
+                coco_eval = (
+                    _evaluate_predictions_on_coco(
+                        self._coco_api, self._coco_results, "bbox", catIds=classes,
+                    )
+                    if len(self._coco_results) > 0
+                    else None  # cocoapi does not handle empty results very well
+                )
+                res_ = self._derive_coco_results(
+                    coco_eval, "bbox", class_names=names,
+                )
+                res = {}
+                for metric in res_.keys():
+                    if len(metric) <= 4:
+                        if split == "all":
+                            res[metric] = res_[metric]
+                        elif split == "base":
+                            res["b" + metric] = res_[metric]
+                        elif split == "novel":
+                            res["n" + metric] = res_[metric]
+                self._results["bbox"].update(res)
+            # if evaluate on novel dataset only
+            if "AP" not in self._results["bbox"]:
+                if "nAP" in self._results["bbox"]:
+                    self._results["bbox"]["AP"] = self._results["bbox"]["nAP"]
+                else:
+                    self._results["bbox"]["AP"] = self._results["bbox"]["bAP"]
+
+VOC_THING_CLASSES = ['person', 'bird', 'cat', 'cow', 'dog', 'horse',
+                 'sheep', 'airplane', 'bicycle', 'boat', 'bus',
+                 'car', 'motorcycle', 'train', 'bottle', 'chair',
+                 'dining table', 'potted plant', 'couch', 'tv/monitor']
+
+class VOCPrecompEpisodicEvaluator(COCOEvaluator):
+    def __init__(self, dataset_name, cfg, distributed,
+                 output_dir=None, eval_classes='base', way=3, conditioned_output=True):
+        super(VOCPrecompEpisodicEvaluator, self).__init__(dataset_name, cfg, distributed, output_dir)
+        self.way = way
+        metadata = _get_coco_fewshot_instances_meta()
+        self.conditioned_output = conditioned_output
+
+        self._eval_classes = metadata["novel_ids"]
+        self._cls_map = metadata["novel_dataset_id_to_contiguous_id"]
+        self._eval_classes_names = metadata["novel_classes"]
+
+        # This is 0-started, [0, ..., 19]
+        self._eval_classes_contiguous = [self._cls_map[id] for id in self._eval_classes]
+        self._cls_map_reverse = {v: k for k, v in self._cls_map.items()}
+
+        # This is used for dataset mapping in _eval_prediction, so the keys are 0-started and values are 1-started.
+        self.coco2voc = {
+            0: 1, 1: 9, 2: 12, 3: 13, 4: 8, 5: 11, 6: 14, 39: 15, 10: 10, 14: 2, 15: 3,
+            16: 5, 17: 6, 18: 7, 19: 4, 56: 16, 57: 19, 58: 18, 60: 17, 62: 20
+        }
+        # This is used for input-output mapping, both keys and values are 0-started.
+        self.voc2coco = {v - 1: k for k, v in self.coco2voc.items()}
+        # This is 0-started continuous coco novel class id
+        self._eval_classes_contiguous_coco = [self.voc2coco[cls] for cls in self._eval_classes_contiguous]
+
+    def process(self, inputs, model, supports):
+        """ Supports are preloaded lists of dicts.
+        """
+        for input in inputs:
+            rest_classes = torch.unique(input["instances"].gt_classes.to(self._cpu_device)).numpy().tolist()
+            while len(rest_classes) > 0:
+                category = random.choice(rest_classes)
+                epi_classes = [category]
+                for _ in range(self.way - 1):
+                    while True:
+                        other_cat = random.choice(self._eval_classes_contiguous)
+                        if other_cat not in epi_classes:
+                            epi_classes.append(other_cat)
+                            break
+
+                attentions = [sup for sup in supports if sup["class"] in epi_classes]
+                output = model(input, attentions)
+                assert "instances" in output
+                instances = output["instances"].to(self._cpu_device)
+                prediction = {"image_id": input["image_id"]}
+                if self.conditioned_output:
+                    map_dict = {ix: cls for ix, cls in enumerate(epi_classes)}
+                    real_classes = [map_dict[cls] for cls in output["instances"].pred_classes]
+                    output["instances"].pred_classes = torch.cat(real_classes)
+
+                epi_instances = Instances(instances.image_size)
+                pickups = torch.zeros_like(instances.pred_classes, dtype=torch.bool)
+                for cls in epi_classes:
+                    pickups += instances.pred_classes == cls
+                if torch.nonzero(pickups).numel() > 0:
+                    print("warning: no gt class pred found during this episode")
+                    for cat in epi_classes:
+                        if cat in rest_classes:
+                            rest_classes.remove(cat)
+
+                epi_instances.pred_classes = instances.pred_classes[pickups]
+                epi_instances.pred_boxes = instances.pred_boxes[pickups]
+                epi_instances.scores = instances.scores[pickups]
+                if hasattr(instances, "pred_masks"):
+                    epi_instances.pred_masks = instances.pred_masks[pickups]
+
+                prediction["instances"] = instances_to_coco_json(epi_instances, input["image_id"])
+                self._predictions.append(prediction)
+
+                for cat in epi_classes:
+                    if cat in rest_classes:
+                        rest_classes.remove(cat)
+
+    def _eval_predictions(self, tasks, predictions):
+        """
+        Evaluate predictions on the given tasks.
+        Fill self._results with the metrics of the tasks.
+        """
+        self._logger.info("Preparing results for COCO format ...")
+        self._coco_results = list(itertools.chain(*[x["instances"] for x in predictions]))
+
+        # Change: unmap the category ids for VOC
+        reverse_id_mapping = self.coco2voc
+        for result in self._coco_results:
+            category_id = result["category_id"]
+            assert (
+                category_id in reverse_id_mapping
+            ), "A prediction has category_id={}, which is not available in the dataset.".format(
+                category_id
+            )
+            result["category_id"] = reverse_id_mapping[category_id]
+
+        if self._output_dir:
+            file_path = os.path.join(self._output_dir, "coco_instances_results.json")
+            self._logger.info("Saving results to {}".format(file_path))
+            with PathManager.open(file_path, "w") as f:
+                f.write(json.dumps(self._coco_results))
+                f.flush()
+
+        if not self._do_evaluation:
+            self._logger.info("Annotations are not available for evaluation.")
+            return
+
+        self._logger.info("Evaluating predictions ...")
+        # General detection evaluation
+        if not self._is_splits:
+            for task in sorted(tasks):
+                coco_eval = (
+                    _evaluate_predictions_on_coco(
+                        self._coco_api, self._coco_results, task, kpt_oks_sigmas=self._kpt_oks_sigmas,
+                        catIds=self._eval_classes
+                    )
+                    if len(self._coco_results) > 0
+                    else None  # cocoapi does not handle empty results very well
+                )
+
+                res = self._derive_coco_results(
+                    coco_eval, task, class_names=VOC_THING_CLASSES
+                )
+                self._results[task] = res
+        # Few-Shot detection evaluation
+        else:
+            self._results["bbox"] = {}
+            for split, classes, names in [
+                ("all", None, self._metadata.get("thing_classes")),
+                ("base", self._base_classes, self._metadata.get("base_classes")),
+                ("novel", self._novel_classes, self._metadata.get("novel_classes"))]:
+                if "all" not in self._dataset_name and \
+                        split not in self._dataset_name:
+                    continue
+                coco_eval = (
+                    _evaluate_predictions_on_coco(
+                        self._coco_api, self._coco_results, "bbox", catIds=classes,
+                    )
+                    if len(self._coco_results) > 0
+                    else None  # cocoapi does not handle empty results very well
+                )
+                res_ = self._derive_coco_results(
+                    coco_eval, "bbox", class_names=VOC_THING_CLASSES,
+                )
+                res = {}
+                for metric in res_.keys():
+                    if len(metric) <= 4:
+                        if split == "all":
+                            res[metric] = res_[metric]
+                        elif split == "base":
+                            res["b" + metric] = res_[metric]
+                        elif split == "novel":
+                            res["n" + metric] = res_[metric]
+                self._results["bbox"].update(res)
+            # if evaluate on novel dataset only
+            if "AP" not in self._results["bbox"]:
+                if "nAP" in self._results["bbox"]:
+                    self._results["bbox"]["AP"] = self._results["bbox"]["nAP"]
+                else:
+                    self._results["bbox"]["AP"] = self._results["bbox"]["bAP"]
+
+precomp_evaluators = [COCOPrecompEpisodicEvaluator, VOCPrecompEpisodicEvaluator]
+
+def episodic_inference_on_dataset(model, data_loader, evaluator, attentions):
+    assert isinstance(model, MetaRCNN)
+    assert type(evaluator) in precomp_evaluators
+
+    num_devices = get_world_size()
+    logger = logging.getLogger(__name__)
+    logger.info("Start inference on {} images".format(len(data_loader)))
+
+    total = len(data_loader)  # inference data loader must have a fixed length
+    if evaluator is None:
+        # create a no-op evaluator
+        evaluator = DatasetEvaluators([])
+    evaluator.reset()
+
+    num_warmup = min(5, total - 1)
+    start_time = time.perf_counter()
+    total_compute_time = 0
+
+    with inference_context(model), torch.no_grad():
+        for idx, inputs in enumerate(data_loader):
+            if idx == num_warmup:
+                start_time = time.perf_counter()
+                total_compute_time = 0
+
+            start_compute_time = time.perf_counter()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            evaluator.process(inputs, model, attentions)
+            total_compute_time += time.perf_counter() - start_compute_time
+
+            iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
+            seconds_per_img = total_compute_time / iters_after_start
+            if idx >= num_warmup * 2 or seconds_per_img > 5:
+                total_seconds_per_img = (time.perf_counter() - start_time) / iters_after_start
+                eta = datetime.timedelta(seconds=int(total_seconds_per_img * (total - idx - 1)))
+                log_every_n_seconds(
+                    logging.INFO,
+                    "Inference done {}/{}. {:.4f} s / img. ETA={}".format(
+                        idx + 1, total, seconds_per_img, str(eta)
+                    ),
+                    n=5,
+                )
+
+    # Measure the time only for this worker (before the synchronization barrier)
+    total_time = time.perf_counter() - start_time
+    total_time_str = str(datetime.timedelta(seconds=total_time))
+    # NOTE this format is parsed by grep
+    logger.info(
+        "Total inference time: {} ({:.6f} s / img per device, on {} devices)".format(
+            total_time_str, total_time / (total - num_warmup), num_devices
+        )
+    )
+    total_compute_time_str = str(datetime.timedelta(seconds=int(total_compute_time)))
+    logger.info(
+        "Total inference pure compute time: {} ({:.6f} s / img per device, on {} devices)".format(
+            total_compute_time_str, total_compute_time / (total - num_warmup), num_devices
+        )
+    )
+
+    results = evaluator.evaluate()
+    # An evaluator may return None when not in main process.
+    # Replace it by an empty dict instead to make it easier for downstream code to handle
+    if results is None:
+        results = {}
+    return results

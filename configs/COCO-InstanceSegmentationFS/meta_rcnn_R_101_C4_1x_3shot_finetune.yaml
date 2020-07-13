@@ -1,0 +1,28 @@
+_BASE_: "../Base-RCNN-C4.yaml"
+MODEL:
+  META_ARCHITECTURE: "MetaRCNN"
+  WEIGHTS: "checkpoints/coco/meta_rcnn/meta_rcnn_R_101_C4_3shot/model_reset_remove.pth"
+  MASK_ON: True
+  RESNETS:
+    DEPTH: 101
+  ROI_HEADS:
+    NAME: "MetaRes5ROIHeads"
+    NUM_CLASSES: 80
+  ROI_BOX_HEAD:
+    CLS_AGNOSTIC_BBOX_REG: False
+  ROI_MASK_HEAD:
+    CLS_AGNOSTIC_MASK: False
+DATASETS:
+  TRAIN: ('coco_3s_finetune',)
+  TEST: ('coco_val_all',)
+SOLVER:
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.001
+  STEPS: (14400,)
+  CHECKPOINT_PERIOD: 1000
+  MAX_ITER: 16000
+  WARMUP_ITERS: 10
+METARCNN:
+  EXTERNAL_SUPPORT_JSON: ('coco_3s_support',)
+  PHASE: 2
+OUTPUT_DIR: "checkpoints/coco/meta_rcnn/meta_rcnn_R_101_C4_3shot"
